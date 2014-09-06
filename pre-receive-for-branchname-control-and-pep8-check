@@ -1,0 +1,272 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+"""
+A git hook, pre-receive script for handling those actions:
+    * Enforce name conventions for the branches to be pushed
+    to the repository
+    * PEP8 - Code quality check right before code is pushed
+    to the repository.
+
+This script makes a system call to built-in git program, instead of
+using any git interacting python lib. The reason for this is it takes
+longer time to load and parse git repository with those libs.
+"""
+
+import difflib
+import re
+import shlex
+import sys
+from subprocess import Popen, PIPE
+from ConfigParser import SafeConfigParser
+
+REGEX = "branchprefix*branchsuffix" #REGEX that checks the branch names
+NULL_COMMIT = "0" * 40
+# Write PEP8_IGNORES string as PEP8 rules to be ignored,
+# separated with ',' with each other consecutively.
+# No space before or after ','
+#PEP8_IGNORES = "W292,E132"
+PEP8_IGNORES = ""
+
+
+def parse_config():
+    """
+    Reads the ini style configuration file 'git-hooks-conf.ini'
+    For further details on ConfigParser, see:
+        http://pymotw.com/2/ConfigParser/
+    """
+    global REGEX
+    global PEP8_IGNORES
+    # a list containing the prefixes that come from conf file
+    branch_prefixes = []
+    parser = SafeConfigParser()
+    # You can write more than one ini files as an argument to parser.read
+    # function. See the link in pydoc of this function for details.
+    if not parser.read('hooks/git-hooks-conf.ini'):
+        # If correspondent ini file(s) not found, return.
+        return
+    if parser.has_section('pre-receive'):
+        for key, value in parser.items('pre-receive'):
+            if key.startswith('prefix'):
+                branch_prefixes.append("(%s-\d+)" % value)
+            if key == "pep8_ignores":
+                PEP8_IGNORES = value
+        branch_prefixes.append(MKF_BRANCH_PREFIX_REGEX)
+        branch_prefixes.append(RELEASE_PREFIX_REGEX)
+        REGEX = "(" + "|".join(branch_prefixes) + ")"
+
+
+def run(command, shell=False, splitter=None, stripped=True):
+    """
+    Run the given command, wait until the command is executed, then,
+    if the process is succesful, return the result list. If splittter is
+    provided, return splitted result.
+
+    shlex is used for parsing the command. See below link for details.
+    http://docs.python.org/2/library/subprocess.html#popen-constructor
+    """
+    p = Popen(shlex.split(command), shell=shell, stdout=PIPE, stderr=PIPE)
+    (stdout, stderr) = p.communicate()
+    if not stderr:
+        if not splitter:
+            if not stripped:
+                return stdout
+            else:
+                return stdout.strip()
+        elif stripped:
+            return stdout.strip().split(splitter)
+        else:
+            return stdout.split(splitter)
+    else:
+        print stderr
+        sys.exit(p.returncode)
+
+
+def wrong_branch_name_print_message():
+    """
+    Puts up a warning message if the pushed branch name is not appropriate.
+    """
+    print "***************************************************************"
+    print "* Check your branch name, It doesn't follow our               *"
+    print "* branch name rules.                                          *"
+    print "***************************************************************"
+
+
+def get_external_prog(prog):
+    """
+    Return the external program's path via 'which' UNIX command.
+    If not found, print an error message and exit.
+    """
+    PROG = run('which ' + prog)
+    if not PROG:
+        print "**************************************************"
+        print "%s command not found on the server." % prog
+        print "please inform the sysadmins about this situation!"
+        print "**************************************************"
+        sys.exit(-4)
+    return PROG
+
+
+def get_changed_files_and_mergebase(base, commit):
+    """
+    Return two lists: added and modified files in the requested push.
+    """
+
+    # Changed files can be:
+    # Added (A),
+    # Copied (C), (if -C/--find-copies parameter is given to git-diff)
+    # Deleted (D),
+    # Modified (M),
+    # Renamed (R), (if -M/--find-renames parameter is given to git-diff)
+    # have their type (i.e. regular file, symlink, submodule, ...) changed (T),
+    # are Unmerged (U),
+    # are Unknown (X),
+    # or have had their pairing Broken (B),
+    #   (if -B/--break-rewrites parameter is given to git-diff)
+    #   See http://stackoverflow.com/a/6068691/566715 for details.
+    #
+    # So, we are only interested in Added(A) and Modified(M) files
+
+    # If a new branch is being pushed, we use the merge-base between master
+    # and latest commit. So that we can find the oldest ancestor of both
+    # commits. The case is the same for forced pushes. So we depend on
+    # merge-base
+    base = run('git merge-base -a master %s' % commit)
+
+    added_or_modified_files = run(
+        'git diff --name-status --diff-filter=AM %s..%s' % (base, commit),
+        splitter='\n')
+
+    added_files = []
+    modified_files = []
+
+    for the_file in added_or_modified_files:
+        if the_file.startswith('A\t'):
+            added_files.append(the_file.strip('A\t'))
+        elif the_file.startswith('M\t'):
+            modified_files.append(the_file.strip('M\t'))
+
+    return added_files, modified_files, base
+
+
+def get_file_content(fname, commit):
+    """
+    Return fname file's content at the specified commit.
+    """
+    return run('git show %s:%s' % (commit, fname), stripped=False)
+
+
+def get_modified_lines(fname, base, commit):
+    """
+    Return a list of modified lines from base to commit.
+    Inspired from http://stackoverflow.com/a/9506715/566715
+    """
+    old_content = get_file_content(fname, base)
+    new_content = get_file_content(fname, commit)
+
+    d = difflib.Differ()
+    diffs = d.compare(old_content.split('\n'), new_content.split('\n'))
+    lineNum = 0
+    lines = []
+
+    for line in diffs:
+    # split off the code
+        code = line[:2]
+        # if the line is in both files or just b, increment the line number.
+        if code in ("  ", "+ "):
+            lineNum += 1
+        # if this line is only in b, add the line number to lines list.
+        if code == "+ ":
+            lines.append(lineNum)
+
+    return lines
+
+
+def pep8(filename, content):
+    """
+    Checks the given file content with pep8.
+    run() function is not used here, because of the need
+    for p.communicate().
+    """
+    PEP8 = get_external_prog('pep8')
+    if PEP8_IGNORES:
+        cmd = PEP8 + " -r --ignore=" + PEP8_IGNORES + " /dev/stdin "
+    else:
+        cmd = PEP8 + " -r /dev/stdin "
+
+    p = Popen(shlex.split(cmd), stdin=PIPE, stdout=PIPE, stderr=PIPE)
+    pep8_output = p.communicate(content)[0]
+    return pep8_output.replace("/dev/stdin", filename)
+
+
+def check_code_for_pep8(base, commit, ref):
+    """
+    pep8 check for the changed files in the commit.
+    We are interested in pep8 problems only in the current commits.
+    So pep8 check on the whole changed file, but only bork-bork if
+    those pep8 problems are in the changed part of the file.
+    """
+    added_files, modif_files, base = get_changed_files_and_mergebase(
+        base, commit)
+    pep8_violation = False
+
+    for fname in added_files:
+        if fname[-3:] == ".py":
+            print "[PEP8] check on newly added file: ", fname
+            content = get_file_content(fname, commit)
+            pep8_messages = pep8(fname, content)
+            if pep8_messages:
+                pep8_violation = True
+                print pep8_messages
+
+    for fname in modif_files:
+        if fname[-3:] == ".py":
+            print "[PEP8] check on modified file: ", fname
+            content = get_file_content(fname, commit)
+            pep8_messages = pep8(fname, content)
+            if pep8_messages:
+                modified_lines = get_modified_lines(fname, base, commit)
+                # when splitted with '\n', pep8_messages comes with
+                # a '' at the end, skip this.
+                for pep8_msg in pep8_messages.split('\n')[:-1]:
+                    line_no = pep8_msg.split(":")[1]
+                    if int(line_no) in modified_lines:
+                        pep8_violation = True
+                        print pep8_msg
+
+    return pep8_violation
+
+
+def main():
+    """
+    main is main.
+    """
+    parse_config()
+    line = sys.stdin.read()
+    (base, commit, ref) = line.strip().split()
+    branch_name = ref[len("refs/heads/"):]
+
+    # IF BRANCH IS master:
+    if branch_name == "master":
+        return
+
+    # CREATING A NEW BRANCH
+    if base == NULL_COMMIT:
+        # Check whether the branch_name obeys our name conventions or not.
+        # Because we check with re.match, no ^ is put in front of the regex
+        # patterns.
+        if not re.match(REGEX, branch_name):
+            wrong_branch_name_print_message()
+            sys.exit(-1)
+
+    # DELETING A BRANCH:
+    if commit == NULL_COMMIT:
+        # That means a branch is being deleted.
+        # No need to check whether it obeys our name conventions or not.
+        # We can allow this.
+        return
+
+    if check_code_for_pep8(base, commit, ref):
+        sys.exit(-2)
+
+if __name__ == '__main__':
+    main()

@@ -1,3 +1,8 @@
+"""
+
+    Written and released by Serdar Dalgic <sd AT serdardalgic DOT org>
+
+"""
 import re
 import shlex
 import sys

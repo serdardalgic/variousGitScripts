@@ -10,6 +10,9 @@ A git hook, pre-receive script for handling those actions:
 This script makes a system call to built-in git program, instead of
 using any git interacting python lib. The reason for this is it takes
 longer time to load and parse git repository with those libs.
+
+    Written and released by Serdar Dalgic <sd AT serdardalgic DOT org>
+
 """
 
 import difflib
